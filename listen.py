@@ -28,6 +28,10 @@ use_PID = 0
 KP, KI, KD = 0, 0, 0
 MAX_CORRECTION = 30  # Maximum PWM correction value
 
+# PID for turning
+use_PID_turn = 0
+KP_turn, KI_turn, KD_turn = 0, 0, 0
+
 # Global variables
 running = True
 left_pwm, right_pwm = 0, 0
@@ -41,6 +45,10 @@ PWM_ZERO_TOLERANCE = 1e-2  # Treat very small values as zero for movement classi
 encoder_reset_requested = False
 current_movement, prev_movement = 'stop', 'stop'
 pid_integral, pid_last_error = 0, 0
+turn_pid_integral, turn_pid_last_error = 0, 0
+turn_tick_counter = 0
+last_turn_left_count = 0
+last_turn_right_count = 0
 
 state_lock = threading.Lock()
 
@@ -113,16 +121,30 @@ def right_encoder_callback(channel):
     
 def reset_encoder():
     global left_count, right_count, encoder_reset_requested, prev_left_state, prev_right_state
+    global turn_tick_counter, last_turn_left_count, last_turn_right_count
     with state_lock:
         left_count, right_count = 0, 0
         # Re-sample the hardware state so that the next edge is captured.
         prev_left_state = GPIO.input(LEFT_ENCODER)
         prev_right_state = GPIO.input(RIGHT_ENCODER)
         encoder_reset_requested = True
+        turn_tick_counter = 0
+        last_turn_left_count = 0
+        last_turn_right_count = 0
+
 def reset_pid_state():
     global pid_integral, pid_last_error
     with state_lock:
         pid_integral, pid_last_error = 0, 0
+
+def reset_turn_state():
+    global turn_pid_integral, turn_pid_last_error, turn_tick_counter
+    global last_turn_left_count, last_turn_right_count
+    with state_lock:
+        turn_pid_integral, turn_pid_last_error = 0, 0
+        turn_tick_counter = 0
+        last_turn_left_count = left_count
+        last_turn_right_count = right_count
 
 def emergency_stop(reason=None):
     global left_pwm, right_pwm, use_PID
@@ -133,6 +155,7 @@ def emergency_stop(reason=None):
     if pid_enabled:
         reset_encoder()
         reset_pid_state()
+    reset_turn_state()
     if reason:
         print(f"Emergency stop: {reason}")
 
@@ -229,10 +252,14 @@ def classify_movement(left_value, right_value):
     return 'error'
 
 def pid_control():
-    # Only applies for forward/backward, not turning or error states
-    global left_pwm, right_pwm, left_count, right_count, use_PID, KP, KI, KD, prev_movement, current_movement, pid_integral, pid_last_error, encoder_reset_requested
+    # Only applies for forward/backward, turning and error states
+    global left_pwm, right_pwm, left_count, right_count, use_PID, KP, KI, KD
+    global prev_movement, current_movement, pid_integral, pid_last_error, encoder_reset_requested
+    global use_PID_turn, KP_turn, KI_turn, KD_turn, turn_pid_integral, turn_pid_last_error
+    global turn_tick_counter, last_turn_left_count, last_turn_right_count
 
     reset_pid_state()
+    reset_turn_state()
     last_time = monotonic()
     prev_left_sample = 0
     prev_right_sample = 0
@@ -247,21 +274,53 @@ def pid_control():
         current_time = monotonic()
         dt = current_time - last_time
         last_time = current_time
-        reset_samples = False
+
         with state_lock:
-            previous_movement = current_movement
+            previous_state = current_movement
             current_state = classify_movement(left_pwm, right_pwm)
-            prev_movement = previous_movement
+            prev_movement = previous_state
             current_movement = current_state
 
             local_left_pwm = left_pwm
             local_right_pwm = right_pwm
             local_left_count = left_count
             local_right_count = right_count
-            local_use_pid = use_PID
+            local_use_pid = bool(use_PID)
+            local_use_pid_turn = bool(use_PID_turn)
             local_kp, local_ki, local_kd = KP, KI, KD
+            local_kp_turn, local_ki_turn, local_kd_turn = KP_turn, KI_turn, KD_turn
+
+            if previous_state != current_state:
+                turn_pid_integral = 0
+                turn_pid_last_error = 0
+                if current_state in ('turn_left', 'turn_right'):
+                    turn_tick_counter = 0
+                    last_turn_left_count = left_count
+                    last_turn_right_count = right_count
+                else:
+                    last_turn_left_count = left_count
+                    last_turn_right_count = right_count
+                    if current_state == 'stop':
+                        turn_tick_counter = 0
+
+            if current_state in ('turn_left', 'turn_right'):
+                left_delta = left_count - last_turn_left_count
+                right_delta = right_count - last_turn_right_count
+
+                if left_delta > 0:
+                    turn_tick_counter += left_delta
+                    last_turn_left_count = left_count
+                elif right_delta > 0:
+                    turn_tick_counter += right_delta
+                    last_turn_right_count = right_count
+            else:
+                last_turn_left_count = left_count
+                last_turn_right_count = right_count
+
             local_pid_integral = pid_integral
             local_pid_last_error = pid_last_error
+            local_turn_pid_integral = turn_pid_integral
+            local_turn_pid_last_error = turn_pid_last_error
             reset_samples = encoder_reset_requested
             if encoder_reset_requested:
                 encoder_reset_requested = False
@@ -269,20 +328,36 @@ def pid_control():
         if reset_samples:
             prev_left_sample = local_left_count
             prev_right_sample = local_right_count
-        if not local_use_pid:
-            target_left_pwm = local_left_pwm
-            target_right_pwm = local_right_pwm
+        target_left_pwm = local_left_pwm
+        target_right_pwm = local_right_pwm
 
-        else:
-            delta_left = local_left_count - prev_left_sample
-            delta_right = local_right_count - prev_right_sample
-            if current_state in ('forward', 'backward'):
+        delta_left = local_left_count - prev_left_sample
+        delta_right = local_right_count - prev_right_sample
+
+        if current_state in ('forward', 'backward') and local_use_pid:
+            error = local_left_count - local_right_count
+            proportional = local_kp * error
+            updated_integral = local_pid_integral + local_ki * error * dt
+            updated_integral = max(-MAX_CORRECTION, min(updated_integral, MAX_CORRECTION))  # Anti-windup
+            derivative = local_kd * (error - local_pid_last_error) / dt if dt > 0 else 0
+            correction = proportional + updated_integral + derivative
+            correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
+
+            target_left_pwm = local_left_pwm - correction
+            target_right_pwm = local_right_pwm + correction
+
+            with state_lock:
+                pid_integral = updated_integral
+                pid_last_error = error
+
+        elif current_state in ('turn_left', 'turn_right'):
+            if local_use_pid_turn:
                 error = local_left_count - local_right_count
-                proportional = local_kp * error
-                updated_integral = local_pid_integral + local_ki * error * dt
-                updated_integral = max(-MAX_CORRECTION, min(updated_integral, MAX_CORRECTION))  # Anti-windup
-                derivative = local_kd * (error - local_pid_last_error) / dt if dt > 0 else 0
-                correction = proportional + updated_integral + derivative
+                proportional = local_kp_turn * error
+                updated_turn_integral = local_turn_pid_integral + local_ki_turn * error * dt
+                updated_turn_integral = max(-MAX_CORRECTION, min(updated_turn_integral, MAX_CORRECTION))
+                derivative = local_kd_turn * (error - local_turn_pid_last_error) / dt if dt > 0 else 0
+                correction = proportional + updated_turn_integral + derivative
                 correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
                             
 
@@ -290,9 +365,9 @@ def pid_control():
                 target_right_pwm = local_right_pwm + correction
 
                 with state_lock:
-                    pid_integral = updated_integral
-                    pid_last_error = error
-            elif current_state in ('turn_left', 'turn_right'):
+                    turn_pid_integral = updated_turn_integral
+                    turn_pid_last_error = error
+            elif local_use_pid:
                 abs_left_pwm = abs(local_left_pwm)
                 abs_right_pwm = abs(local_right_pwm)
                 abs_delta_left = abs(delta_left)
@@ -301,16 +376,16 @@ def pid_control():
                 if abs_delta_left + abs_delta_right == 0:
                     error = 0
                 elif abs_left_pwm > PWM_ZERO_TOLERANCE and abs_right_pwm > PWM_ZERO_TOLERANCE:
-                    expected_right = (abs_right_pwm / abs_left_pwm) * abs_delta_left
+                    expected_right = (abs_right_pwm / max(abs_left_pwm, 1e-6)) * abs_delta_left
                     error = expected_right - abs_delta_right
                 else:
                     error = abs_delta_left - abs_delta_right
 
                 proportional = local_kp * error
-                updated_integral = local_pid_integral + local_ki * error * dt
-                updated_integral = max(-MAX_CORRECTION, min(updated_integral, MAX_CORRECTION))
-                derivative = local_kd * (error - local_pid_last_error) / dt if dt > 0 else 0
-                correction = proportional + updated_integral + derivative
+                updated_turn_integral = local_turn_pid_integral + local_ki * error * dt
+                updated_turn_integral = max(-MAX_CORRECTION, min(updated_turn_integral, MAX_CORRECTION))
+                derivative = local_kd * (error - local_turn_pid_last_error) / dt if dt > 0 else 0
+                correction = proportional + updated_turn_integral + derivative
                 correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
 
                 left_direction = 1 if local_left_pwm >= 0 else -1
@@ -323,32 +398,32 @@ def pid_control():
                 target_right_pwm = right_direction * adjusted_right
 
                 with state_lock:
-                    pid_integral = updated_integral
-                    pid_last_error = error              
+                    turn_pid_integral = updated_turn_integral
+                    turn_pid_last_error = error            
             else:
-                if current_movement == 'stop':
-                    # Reset when stopped to clear any accumulated correction
-                    reset_pid_state()
-                    reset_encoder()
+                # PID disabled for turning
                 target_left_pwm = local_left_pwm
                 target_right_pwm = local_right_pwm
 
-        if current_movement == 'error':
-            # Ignore invalid PWM commands and actively stop the robot
+        else:
+            if current_state == 'stop':
+                reset_pid_state()
+                reset_encoder()
+                reset_turn_state()
+
+        if current_state == 'error':
             target_left_pwm = 0
             target_right_pwm = 0
             if local_use_pid:
                 reset_pid_state()
-                reset_encoder()
+            reset_turn_state()
         
         if current_state == 'error':
-            # Apply zero output immediately when ignoring invalid commands
             ramp_left_pwm = target_left_pwm
             ramp_right_pwm = target_right_pwm
             previous_left_target = target_left_pwm
             previous_right_target = target_right_pwm
-        elif use_ramping and local_use_pid:
-            # PWM Ramping Logic
+        elif use_ramping and (local_use_pid or local_use_pid_turn):
             max_change_per_cycle = RAMP_RATE * dt
             
             # Calculate differences for both motors
@@ -377,21 +452,13 @@ def pid_control():
                     if abs(left_diff) <= max_change_per_cycle:
                         ramp_left_pwm = target_left_pwm  # Close enough, set to target
                     else:
-                        # Ramp towards target (up or down)
-                        if left_diff > 0:
-                            ramp_left_pwm += max_change_per_cycle
-                        else:
-                            ramp_left_pwm -= max_change_per_cycle
-                    
+                        ramp_left_pwm += max_change_per_cycle if left_diff > 0 else -max_change_per_cycle
+
                     # Right motor ramping (including ramp-down to zero)
                     if abs(right_diff) <= max_change_per_cycle:
                         ramp_right_pwm = target_right_pwm  # Close enough, set to target
                     else:
-                        # Ramp towards target (up or down)
-                        if right_diff > 0:
-                            ramp_right_pwm += max_change_per_cycle
-                        else:
-                            ramp_right_pwm -= max_change_per_cycle
+                        ramp_right_pwm += max_change_per_cycle if right_diff > 0 else -max_change_per_cycle
                 else:
                     # Neither motor needs ramping - apply targets directly
                     ramp_left_pwm = target_left_pwm
@@ -414,8 +481,17 @@ def pid_control():
             with state_lock:
                 debug_left = left_count
                 debug_right = right_count
-            print(f"(Left PWM, Right PWM)=({ramp_left_pwm:.2f},{ramp_right_pwm:.2f}), (Left Enc, Right Enc)=({debug_left}, {debug_right})")
-
+                debug_turn = turn_tick_counter
+            if current_state in ('turn_left', 'turn_right'):
+                print(
+                    f"(Left PWM, Right PWM)=({ramp_left_pwm:.2f},{ramp_right_pwm:.2f}), "
+                    f"(Left Enc, Right Enc)=({debug_left}, {debug_right}), Turn Ticks={debug_turn}"
+                )
+            else:
+                print(
+                    f"(Left PWM, Right PWM)=({ramp_left_pwm:.2f},{ramp_right_pwm:.2f}), "
+                    f"(Left Enc, Right Enc)=({debug_left}, {debug_right})"
+                )
         prev_left_sample = local_left_count
         prev_right_sample = local_right_count
         time.sleep(0.01)
@@ -492,7 +568,7 @@ def recv_exact(sock, size):
     return bytes(chunks)
 
 def pid_config_server():
-    global use_PID, KP, KI, KD
+    global use_PID, KP, KI, KD, use_PID_turn, KP_turn, KI_turn, KD_turn
     
     # Create socket for receiving PID configuration
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -507,20 +583,35 @@ def pid_config_server():
             print(f"PID config client connected")
             
             try:
+                client_socket.settimeout(1.0)
                 # Receive PID constants (4 floats)
                 data = recv_exact(client_socket, 16)
                 if data is not None:
                     new_use_pid, new_kp, new_ki, new_kd = struct.unpack("!ffff", data)
+                    client_socket.settimeout(0.1)
+                    extra = recv_exact(client_socket, 16)
+                    if extra is not None:
+                        new_use_pid_turn, new_kp_turn, new_ki_turn, new_kd_turn = struct.unpack("!ffff", extra)
+                    else:
+                        new_use_pid_turn, new_kp_turn, new_ki_turn, new_kd_turn = 0.0, 0.0, 0.0, 0.0
+                    client_socket.settimeout(None)
+
                     with state_lock:
                         use_PID = new_use_pid
                         KP, KI, KD = new_kp, new_ki, new_kd
+                        use_PID_turn = new_use_pid_turn
+                        KP_turn, KI_turn, KD_turn = new_kp_turn, new_ki_turn, new_kd_turn
                         pid_enabled = bool(use_PID)
+                        pid_turn_enabled = bool(use_PID_turn)
                     if pid_enabled:
                         print(f"Updated PID constants: KP={KP}, KI={KI}, KD={KD}")
                     else:
                         print("The robot is not using PID.")
-                    
-                    # Send acknowledgment (1 for success)
+
+                    if pid_turn_enabled:
+                        print(f"Updated turning PID: KP={KP_turn}, KI={KI_turn}, KD={KD_turn}")
+                    else:
+                        print("Turning PID disabled.")
                     response = struct.pack("!i", 1)
                 else:
                     print("PID config client disconnected")
@@ -546,7 +637,7 @@ def pid_config_server():
     
 
 def wheel_server():
-    global left_pwm, right_pwm, running, left_count, right_count
+    global left_pwm, right_pwm, running, left_count, right_count, turn_tick_counter
     
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -576,9 +667,10 @@ def wheel_server():
                         right_pwm = right_speed*100
                         current_left_count = left_count
                         current_right_count = right_count
-                    
-                    # Send encoder counts back
-                    response = struct.pack("!ii", current_left_count, current_right_count)
+                        current_turn_ticks = turn_tick_counter
+
+                    # Send encoder counts back along with turn tick counter
+                    response = struct.pack("!iii", current_left_count, current_right_count, current_turn_ticks)
                     client_socket.sendall(response)
                     
                 except Exception as e:
